@@ -539,7 +539,15 @@ $(function () {
 
 	OCTOPRINT_VIEWMODELS.push({
 		construct: bedlevelvisualizerViewModel,
-		dependencies: ["settingsViewModel", "controlViewModel", "loginStateViewModel"],
-		elements: ["#settings_plugin_bedlevelvisualizer", "#tab_plugin_bedlevelvisualizer", "#wizard_plugin_bedlevelvisualizer"]
+		dependencies: [
+		  "settingsViewModel",
+		  "controlViewModel",
+		  "loginStateViewModel"
+		],
+		elements: [
+		  "#settings_plugin_bedlevelvisualizer",
+		  "#tab_plugin_bedlevelvisualizer",
+		  "#wizard_plugin_bedlevelvisualizer"
+		]
 	});
 });
