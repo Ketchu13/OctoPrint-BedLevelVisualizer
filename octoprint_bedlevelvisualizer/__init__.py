@@ -13,7 +13,6 @@ from copy import deepcopy
 
 from octoprint.server.util.flask import get_json_command_from_request
 
-
 class bedlevelvisualizer(
     octoprint.plugin.StartupPlugin,
     octoprint.plugin.TemplatePlugin,
@@ -28,45 +27,36 @@ class bedlevelvisualizer(
     MAX_HISTORY = 10
 
     def __init__(self):
-        self.processing = False
-        self.printing = False
-        self.mesh_collection_canceled = False
-        self.old_marlin = False
-        self.makergear = False
-        self.old_marlin_offset = 0
-        self.repetier_firmware = False
-        self.mesh = []
-        self.mesh_minmax = []
+        self._logger = None
         self.bed = {}
         self.bed_type = None
         self.box = []
         self.flip_x = False
         self.flip_y = False
-        self.timeout_override = False
-        self._bedlevelvisualizer_logger = None
-        self.regex_mesh_data = re.compile(
-            r"^(\s?\d+\s)(\s?\+?\-?\d+?\.\d+\s*)(\s?\+?-?\d+?\.\d+\s*)*$"
-        )
-        self.regex_bed_level_correction = re.compile(
-            r"^(Mesh )?Bed Level (Correction Matrix|data):.*$"
-        )
-        self.regex_nans = re.compile(r"^(nan\s?,?)+$")
-        self.regex_equal_signs = re.compile(r"^(=======\s?,?)+$")
-        self.regex_mesh_data_extraction = re.compile(r"(\+?-?\d*\.\d*)")
-        self.regex_old_marlin = re.compile(r"^(Bed x:.+)|(Llit x:.+)$")
-        self.regex_makergear = re.compile(
-            r"^(\s=\s\[)(\s*,?\s*\[(\s?-?\d+.\d+,?)+\])+\];?$"
-        )
-        self.regex_repetier = re.compile(r"^G33 X.+$")
-        self.regex_nan = re.compile(r"(nan)")
-        self.regex_catmull = re.compile(
-         r"^Subdivided with CATMULL ROM Leveling Grid:.*$"
-        )
-        self.regex_extracted_box = re.compile(r"\(\s*(\d+),\s*(\d+)\)")
+        self.makergear = False
+        self.mesh = []
+        self.mesh_collection_canceled = False
+        self.mesh_minmax = []
+        self.old_marlin = False
+        self.old_marlin_offset = 0
+        self.plugin_name = "bedlevelvisualizer"
+        self.printing = False
+        self.processing = False
+        self.regex_bed_level_correction = re.compile(r"^(Mesh )?Bed Level (Correction Matrix|data):.*$")
+        self.regex_catmull = re.compile(r"^Subdivided with CATMULL ROM Leveling Grid:.*$")
         self.regex_eqn_coefficients = re.compile(r"^Eqn coefficients:.+$")
-        self.regex_unknown_command = re.compile(
-            r"echo:Unknown command: \"@BEDLEVELVISUALIZER\""
-        )
+        self.regex_equal_signs = re.compile(r"^(=======\s?,?)+$")
+        self.regex_extracted_box = re.compile(r"\(\s*(\d+),\s*(\d+)\)")
+        self.regex_makergear = re.compile(r"^(\s=\s\[)(\s*,?\s*\[(\s?-?\d+.\d+,?)+\])+\];?$")
+        self.regex_mesh_data = re.compile(r"^(\s?\d+\s)(\s?\+?\-?\d+?\.\d+\s*)(\s?\+?-?\d+?\.\d+\s*)*$")
+        self.regex_mesh_data_extraction = re.compile(r"(\+?-?\d*\.\d*)")
+        self.regex_nan = re.compile(r"(nan)")
+        self.regex_nans = re.compile(r"^(nan\s?,?)+$")
+        self.regex_old_marlin = re.compile(r"^(Bed x:.+)|(Llit x:.+)$")
+        self.regex_repetier = re.compile(r"^G33 X.+$")
+        self.regex_unknown_command = re.compile(r"echo:Unknown command: \"@BEDLEVELVISUALIZER\"")
+        self.repetier_firmware = False
+        self.timeout_override = False
 
     # SettingsPlugin
 
@@ -126,23 +116,39 @@ class bedlevelvisualizer(
             self._settings.set(["commands"], commands_new)
 
     def on_settings_save(self, data):
-        self._bedlevelvisualizer_logger.info("Settings have saved.")
+        old_debug_logging = self._settings.get_boolean(["debug_logging"])
+
+        octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+
+        new_debug_logging = self._settings.get_boolean(["debug_logging"])
+        if old_debug_logging != new_debug_logging:
+            if new_debug_logging:
+                self._logger.setLevel(logging.DEBUG)
+            else:
+                self._logger.setLevel(logging.INFO)
+        self._logger.info("Settings have been saved.")
 
     # StartupPlugin
     def on_after_startup(self):
-        self._bedlevelvisualizer_logger = logging.getLogger("octoprint.plugins.bedlevelvisualizer")
+        # setup customized logger
+        self._logger = logging.getLogger("octoprint.plugins.%s" % self.plugin_name)
         from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
         hdlr = CleaningTimedRotatingFileHandler(
             self._settings.get_plugin_logfile_path(),
             when="D",
             backupCount=3
         )
-
         formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
         hdlr.setFormatter(formatter)
-        self._bedlevelvisualizer_logger.addHandler(hdlr)
+        self._logger.addHandler(hdlr)
+        self._logger.setLevel(
+            logging.DEBUG
+            if self._settings.get_boolean(["debug_logging"])
+            else logging.INFO
+        )
+        self._logger.propagate = False
 
-        self._bedlevelvisualizer_logger.info("OctoPrint-BedLevelVisualizer loaded!")
+        self._logger.info("OctoPrint-BedLevelVisualizer loaded!")
 
     # AssetPlugin
     def get_assets(self):
@@ -183,7 +189,7 @@ class bedlevelvisualizer(
     def enable_mesh_collection(self):
         self.mesh = []
         self.box = []
-        self._bedlevelvisualizer_logger.debug("mesh collection started")
+        self._logger.debug("mesh collection started")
         self.processing = True
         self._plugin_manager.send_plugin_message(
             self._identifier, dict(processing=True)
@@ -192,7 +198,7 @@ class bedlevelvisualizer(
     def flag_mesh_collection(self, comm_instance, phase, command, parameters, tags=None, *args, **kwargs):
         if command == "BEDLEVELVISUALIZER":
             if parameters:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "Timeout override: {}".format(parameters))
                 self._plugin_manager.send_plugin_message(
                     self._identifier, {"timeout_override": parameters})
@@ -223,32 +229,32 @@ class bedlevelvisualizer(
                 if self.regex_bed_level_correction.match(
                     line.strip()
                 ) and not self._settings.get_boolean(["ignore_correction_matrix"]):
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "resetting mesh to blank because of correction matrix"
                     )
                     self.mesh = []
                     return line
                 if self.regex_nans.match(line.strip()):
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "stupid smoothieware issue..."
                     )
                     line = self.regex_nan.sub("0.0", line)
                 if self.regex_equal_signs.match(line.strip()):
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "stupid equal signs...")
                     line = self.regex_equal_signs.sub("0.0", line)
 
                 new_line = self.regex_mesh_data_extraction.findall(line)
-                self._bedlevelvisualizer_logger.debug(new_line)
+                self._logger.debug(new_line)
 
                 if self.regex_old_marlin.match(line.strip()):
                     self.old_marlin = True
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "using old marlin flag")
 
                 if self.regex_repetier.match(line.strip()):
                     self.repetier_firmware = True
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "using repetier flag")
 
                 if self._settings.get_boolean(["stripFirst"]):
@@ -260,12 +266,12 @@ class bedlevelvisualizer(
                 if not self._settings.get_boolean(
                         ["ignore_catmull_mesh"]
                 ):
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                     "resetting mesh to blank because of CATMULL subdivision"
                     )
                     self.mesh = []
                 else:
-                    self._bedlevelvisualizer_logger.error(
+                    self._logger.error(
                         "ignoring catmull rom mesh subdivision"
                     )
                     line = "ok"
@@ -282,25 +288,25 @@ class bedlevelvisualizer(
                         self.flip_y = True
 
             if self.regex_makergear.match(line) is not None:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "using makergear format report")
                 self.mesh = json.loads(
                     line.strip().replace("= ", "").replace(";", ""))
                 self.old_marlin = True
                 self.makergear = True
-                self._bedlevelvisualizer_logger.debug(self.mesh)
+                self._logger.debug(self.mesh)
                 line = "ok"
 
             if self.old_marlin and self.regex_eqn_coefficients.match(line.strip()):
                 self.old_marlin_offset = self.regex_eqn_coefficients.sub(
                     r"\2", line.strip()
                 )
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "using old marlin offset")
 
             if "Home XYZ first" in line or "Invalid mesh" in line:
                 reason = "data is invalid" if "Invalid" in line else "homing required"
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "stopping mesh collection because %s" % reason
                 )
 
@@ -345,7 +351,7 @@ class bedlevelvisualizer(
                 z_min=min_z,
                 z_max=max_z,
             )
-            self._bedlevelvisualizer_logger.debug(self.bed)
+            self._logger.debug(self.bed)
 
             if self.old_marlin or self.repetier_firmware:
                 self.print_mesh_debug("initial mesh data: ", self.mesh)
@@ -377,13 +383,13 @@ class bedlevelvisualizer(
                 offset = 0
                 if self.old_marlin:
                     offset = self.old_marlin_offset
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "mesh offset = " + str(offset))
                 self.mesh = list(
                     map(lambda y: list(map(lambda x: round(float(x) - offset, 4), y)), z))
                 self.print_mesh_debug("mesh after offset: ", self.mesh)
 
-            self._bedlevelvisualizer_logger.debug("stopping mesh collection")
+            self._logger.debug("stopping mesh collection")
 
             if bool(self.flip_x) != bool(self._settings.get(["flipX"])):
                 self.mesh = list(map(lambda x: list(reversed(x)), self.mesh))
@@ -394,10 +400,10 @@ class bedlevelvisualizer(
                 self.print_mesh_debug("flipped y axis: ", self.mesh)
 
             if self._settings.get_boolean(["use_relative_offsets"]):
-                self._bedlevelvisualizer_logger.debug("using relative offsets")
+                self._logger.debug("using relative offsets")
                 # shifting mesh down by origin point height
                 if self._settings.get_boolean(["use_center_origin"]):
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "using center origin")
                     # finding origin point in center
                     offset = self.mesh[len(self.mesh[0]) // 2][len(self.mesh) // 2]
@@ -409,7 +415,7 @@ class bedlevelvisualizer(
                         map(lambda y: list(map(lambda x: round(float(x) - float(offset), 4), y)), self.mesh))
 
             if int(self._settings.get_int(["rotation"])) > 0:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "rotating mesh by %s degrees" % self._settings.get(["rotation"]))
 
                 for i in range(int(self._settings.get_int(["rotation"]) / 90)):
@@ -437,7 +443,7 @@ class bedlevelvisualizer(
     def create_circular_mask(self, y, x):
         center = y/2-0.5, x/2-0.5
         radius = min(center[0], center[1], y - center[0], x - center[1])
-        self._bedlevelvisualizer_logger.debug("Center = " + str(center) + ", Radius = " + str(radius))
+        self._logger.debug("Center = " + str(center) + ", Radius = " + str(radius))
 
         # init emply matrix
         mask = [[False for j in range(x)]
@@ -458,13 +464,13 @@ class bedlevelvisualizer(
 
     # output mesh line by line, with right coordinate directions
     def print_mesh_debug(self, message, mesh):
-        self._bedlevelvisualizer_logger.debug(message)
+        self._logger.debug(message)
         l = len(mesh)
         # print mask data
         min_val = 0.0
         max_val = 0.0
         for i in range(l):
-            self._bedlevelvisualizer_logger.debug(mesh[l-i-1])
+            self._logger.debug(mesh[l - i - 1])
             self._logger.info(mesh[l-i-1])
             self._logger.info("min_val: %s - type: %s" % (min_val, type(min_val)))
             for ik in mesh[l-i-1]:
@@ -478,7 +484,7 @@ class bedlevelvisualizer(
             self.mesh_minmax = [min_val, max_val]
             self._settings.set(["mesh_minmax"], self.mesh_minmax)
             self._settings.set(["graph_z_limits"], "%s,%s" % (min_val, max_val))
-            self._bedlevelvisualizer_logger.debug(self.mesh_minmax)
+            self._logger.debug(self.mesh_minmax)
 
         # print graphical representation
         if self.bed_type == "circular":
@@ -490,14 +496,14 @@ class bedlevelvisualizer(
                     else:
                         pic[i][j] = "Ꚛ"
             for i in range(l):
-                self._bedlevelvisualizer_logger.debug(pic[l-i-1])
+                self._logger.debug(pic[l - i - 1])
         return
 
     # SimpleApiPlugin
     def custom_action_handler(self, comm, line, action, *args, **kwargs):
         if not action == "BEDLEVELVISUALIZER_LEVELBED":
             return
-        self._bedlevelvisualizer_logger.debug("Received BEDLEVELVISUALIZER_LEVELBED command.")
+        self._logger.debug("Received BEDLEVELVISUALIZER_LEVELBED command.")
         self._printer.commands(self._settings.get(["command"]).split("\n"))
         return
 
@@ -515,7 +521,7 @@ class bedlevelvisualizer(
         return dict(getMesh=[], stopProcessing=[], startProcessing=[])
 
     def on_api_command(self, command, data):
-        self._bedlevelvisualizer_logger.debug(
+        self._logger.debug(
             "on_api_command command : %s - data: %s" % (command, data)
         )
         response = dict(
@@ -525,52 +531,52 @@ class bedlevelvisualizer(
 
         # return flask.make_response("Insufficient rights", 403)
         if command == "getMesh":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "on_api_command getMesh"
             )
             mesh = None
             if self.mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_command 1"
                 )
                 if len(self.mesh) > 0:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "on_api_command 2"
                     )
                     mesh = self.mesh
             if not mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_command 3"
                 )
                 if len(self._settings.get(["stored_mesh"])) > 0:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "on_api_command 4"
                     )
                     mesh = self._settings.get(["stored_mesh"])
-                    self._bedlevelvisualizer_logger.debug("using stored mesh for octodash view: {}".format(mesh))
+                    self._logger.debug("using stored mesh for octodash view: {}".format(mesh))
             if mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_command 5"
                 )
                 response = dict(
                     mesh=mesh,
                     success=True
                 )
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "on_api_command 6"
             )
             return flask.make_response(flask.jsonify(response), 200)
 
         elif command == "stopProcessing":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "stopProcessing"
             )
-            self._bedlevelvisualizer_logger.debug(self.mesh)
+            self._logger.debug(self.mesh)
             self.processing = False
             self.mesh_collection_canceled = True
             self.mesh = []
-            self._bedlevelvisualizer_logger.debug("Mesh data after clearing:")
-            self._bedlevelvisualizer_logger.debug(self.mesh)
+            self._logger.debug("Mesh data after clearing:")
+            self._logger.debug(self.mesh)
             response = dict(
                 stopped=True,
                 success=True
@@ -578,18 +584,18 @@ class bedlevelvisualizer(
             return flask.jsonify(response)
 
         elif command == "startProcessing":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "stopProcessing"
             )
             if not self.processing:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "not self.processing"
                 )
 
                 self.processing = True
                 gcode_cmds = self._settings.get(["command"]).split("\n")
                 if "@BEDLEVELVISUALIZER" not in gcode_cmds:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "@BEDLEVELVISUALIZER"
                     )
                     gcode_cmds.insert(0, "@BEDLEVELVISUALIZER")
@@ -614,7 +620,7 @@ class bedlevelvisualizer(
             flask.abort(400, description="command is invalid")
 
         command = data["command"]
-        self._bedlevelvisualizer_logger.debug(
+        self._logger.debug(
             "on_api_command command : %s - data: %s" % (command, data)
         )
 
@@ -625,31 +631,31 @@ class bedlevelvisualizer(
 
         # return flask.make_response("Insufficient rights", 403)
         if command == "getMesh":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "on_api_get getMesh"
             )
             mesh = None
             if self.mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_get 1"
                 )
                 if len(self.mesh) > 0:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "on_api_get 2"
                     )
                     mesh = self.mesh
             if not mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_get 3"
                 )
                 if len(self._settings.get(["stored_mesh"])) > 0:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "on_api_get 4"
                     )
                     mesh = self._settings.get(["stored_mesh"])
-                    self._bedlevelvisualizer_logger.debug("using stored mesh for octodash view: {}".format(mesh))
+                    self._logger.debug("using stored mesh for octodash view: {}".format(mesh))
             if mesh:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "on_api_get 5"
                 )
                 response = dict(
@@ -659,15 +665,15 @@ class bedlevelvisualizer(
             return flask.make_response(flask.jsonify(response), 200)
 
         elif command == "stopProcessing":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "stopProcessing"
             )
-            self._bedlevelvisualizer_logger.debug(self.mesh)
+            self._logger.debug(self.mesh)
             self.processing = False
             self.mesh_collection_canceled = True
             self.mesh = []
-            self._bedlevelvisualizer_logger.debug("Mesh data after clearing:")
-            self._bedlevelvisualizer_logger.debug(self.mesh)
+            self._logger.debug("Mesh data after clearing:")
+            self._logger.debug(self.mesh)
             response = dict(
                 stopped=True,
                 success=True
@@ -675,18 +681,18 @@ class bedlevelvisualizer(
             return flask.make_response(flask.jsonify(response), 200)
 
         elif command == "startProcessing":
-            self._bedlevelvisualizer_logger.debug(
+            self._logger.debug(
                 "stopProcessing"
             )
             if not self.processing:
-                self._bedlevelvisualizer_logger.debug(
+                self._logger.debug(
                     "not self.processing"
                 )
 
                 self.processing = True
                 gcode_cmds = self._settings.get(["command"]).split("\n")
                 if "@BEDLEVELVISUALIZER" not in gcode_cmds:
-                    self._bedlevelvisualizer_logger.debug(
+                    self._logger.debug(
                         "@BEDLEVELVISUALIZER"
                     )
                     gcode_cmds.insert(0, "@BEDLEVELVISUALIZER")
@@ -703,15 +709,15 @@ class bedlevelvisualizer(
         return flask.make_response(flask.jsonify(response), 200)
     """@octoprint.plugin.BlueprintPlugin.route("bedlevelvisualizer")
     def bedlevelvisualizer_route(self):
-        self._bedlevelvisualizer_logger.debug("using internal mesh for octodash view: ")
+        self._logger.debug("using internal mesh for octodash view: ")
 
         try:
             if len(self.mesh) > 0:
                 mesh = self.mesh
-                self._bedlevelvisualizer_logger.debug("using internal mesh for octodash view: {}".format(mesh))
+                self._logger.debug("using internal mesh for octodash view: {}".format(mesh))
             elif len(self._settings.get(["stored_mesh"])) > 0:
                 mesh = self._settings.get(["stored_mesh"])
-                self._bedlevelvisualizer_logger.debug("using stored mesh for octodash view: {}".format(mesh))
+                self._logger.debug("using stored mesh for octodash view: {}".format(mesh))
             bed = self.bed_type
             commands = self._settings.get(["command"]).split("\n")
             render_kwargs = {"mesh": mesh, "bed": bed, "commands": commands}
